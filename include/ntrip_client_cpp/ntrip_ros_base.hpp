@@ -2,6 +2,9 @@
 
 #include <memory>
 #include <string>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
@@ -25,7 +28,7 @@ class NTRIPRosBase : public rclcpp_lifecycle::LifecycleNode
 {
 public:
   explicit NTRIPRosBase(const std::string& node_name);
-  ~NTRIPRosBase() override = default;
+  ~NTRIPRosBase() override;
 
   // Lifecycle transitions
   CallbackReturn on_configure(const rclcpp_lifecycle::State&) override;
@@ -49,9 +52,38 @@ protected:
   bool debug_ = false;
 
 private:
+  enum class ConnectState : uint8_t
+  {
+    Disconnected = 0,
+    Connecting,
+    Connected,
+    Failed,
+  };
+
+  static const char * conn_state_to_string(const ConnectState s)
+  {
+    switch (s)
+    {
+      case ConnectState::Disconnected: return "Disconnected";
+      case ConnectState::Connecting:   return "Connecting";
+      case ConnectState::Connected:    return "Connected";
+      case ConnectState::Failed:       return "Failed";
+    }
+    return "Unknown";
+  }
+  
+  void set_connect_state(const ConnectState state);
+  void connection_loop();
+  void stop_connection_thread();
+
   void subscribe_nmea(const nmea_msgs::msg::Sentence::SharedPtr msg);
   void subscribe_fix(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
   void publish_rtcm();
+
+  std::atomic<ConnectState> connect_state_{ConnectState::Disconnected};
+  std::atomic<bool>         connect_thread_active_{false};
+  std::thread               connect_thread_;
+  mutable std::mutex        client_mtx_;
 
   rclcpp_lifecycle::LifecyclePublisher<rtcm_msgs::msg::Message>::SharedPtr rtcm_pub_;
   rclcpp::Subscription<nmea_msgs::msg::Sentence>::SharedPtr nmea_sub_;

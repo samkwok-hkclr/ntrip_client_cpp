@@ -27,7 +27,7 @@ constexpr size_t kChunkSize = 1024;
 
 const std::vector<std::string> kSourcetableResponses = {"SOURCETABLE 200 OK"};
 const std::vector<std::string> kSuccessResponses = {
-    "ICY 200 OK", "HTTP/1.0 200 OK", "HTTP/1.1 200 OK"};
+  "ICY 200 OK", "HTTP/1.0 200 OK", "HTTP/1.1 200 OK"};
 const std::vector<std::string> kUnauthorizedResponses = {"401"};
 
 double now_seconds() 

@@ -62,6 +62,11 @@ NTRIPRosBase::NTRIPRosBase(const std::string& node_name)
   }
 }
 
+NTRIPRosBase::~NTRIPRosBase()
+{
+  stop_connection_thread();
+}
+
 Logger NTRIPRosBase::make_logger(const rclcpp::Logger& logger) 
 {
   return build_logger(logger);
@@ -117,16 +122,14 @@ CallbackReturn NTRIPRosBase::on_activate(const rclcpp_lifecycle::State&)
     return CallbackReturn::FAILURE;
   }
 
-  if (!client_->connect()) 
-  {
-    RCLCPP_ERROR(get_logger(), "Unable to connect");
-    return CallbackReturn::FAILURE;
-  }
-
   if (rtcm_pub_) 
   {
     rtcm_pub_->on_activate();
   }
+
+  set_connect_state(ConnectState::Disconnected);
+  connect_thread_active_.store(true);
+  connect_thread_ = std::thread([this]() { connection_loop(); });
 
   rtcm_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() { publish_rtcm(); });
 
@@ -148,10 +151,7 @@ CallbackReturn NTRIPRosBase::on_deactivate(const rclcpp_lifecycle::State&)
     rtcm_pub_->on_deactivate();
   }
 
-  if (client_) 
-  {
-    client_->shutdown();
-  }
+  stop_connection_thread();
 
   return CallbackReturn::SUCCESS;
 }
@@ -192,12 +192,105 @@ CallbackReturn NTRIPRosBase::on_error(const rclcpp_lifecycle::State& state)
     rtcm_timer_->cancel();
     rtcm_timer_.reset();
   }
-  if (client_) 
+
+  stop_connection_thread();
+
+  return CallbackReturn::SUCCESS;
+}
+
+void NTRIPRosBase::set_connect_state(const ConnectState state)
+{
+  connect_state_.store(state);
+  RCLCPP_INFO(get_logger(), "NTRIP connection state: %s", conn_state_to_string(state));
+}
+
+void NTRIPRosBase::connection_loop()
+{
+  int attempts = 0;
+
+  while (connect_thread_active_.load())
   {
+    set_connect_state(ConnectState::Connecting);
+
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> lk(client_mtx_);
+      ok = client_->connect();
+    }
+
+    if (!connect_thread_active_.load())
+    {
+      break;
+    }
+
+    if (!ok)
+    {
+      ++attempts;
+
+      RCLCPP_WARN(get_logger(), "NTRIP: connect failed (attempt %d); retrying in %d s",
+        attempts, reconnect_attempt_wait_seconds_);
+
+      // Sleep in small slices so on_deactivate is responsive.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(reconnect_attempt_wait_seconds_);
+      while (connect_thread_active_.load() && std::chrono::steady_clock::now() < deadline)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      continue;
+    }
+
+    // ---- connected ------------------------------------------------------
+    attempts = 0;
+    set_connect_state(ConnectState::Connected);
+    RCLCPP_INFO(get_logger(), "NTRIP connection established");
+
+    // Poll until the socket drops, or the node is being deactivated.
+    while (connect_thread_active_.load() && connect_state_.load() == ConnectState::Connected)
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+      // If your NTRIPBase exposes a way to detect a dropped socket, use it:
+      //   bool still_up = false;
+      //   { std::lock_guard<std::mutex> lk(client_mtx_); still_up = client_->is_connected(); }
+      //   if (!still_up) break;
+      //
+      // Or have send_nmea() / recv_rtcm() set connect_state_ = Disconnected
+      // on socket errors — then this loop wakes up within 500 ms.
+    }
+
+    if (!connect_thread_active_.load())
+    {
+      break;
+    }
+
+    RCLCPP_WARN(get_logger(), "NTRIP connection lost; reconnecting");
+    set_connect_state(ConnectState::Disconnected);
+
+    {
+      std::lock_guard<std::mutex> lk(client_mtx_);
+      client_->shutdown();
+    }
+  }
+
+  set_connect_state(ConnectState::Disconnected);
+}
+
+void NTRIPRosBase::stop_connection_thread()
+{
+  connect_thread_active_.store(false);
+
+  if (connect_thread_.joinable())
+  {
+    connect_thread_.join();
+  }
+
+  if (client_)
+  {
+    std::lock_guard<std::mutex> lk(client_mtx_);
     client_->shutdown();
   }
 
-  return CallbackReturn::SUCCESS;
+  set_connect_state(ConnectState::Disconnected);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +301,11 @@ void NTRIPRosBase::subscribe_nmea(const nmea_msgs::msg::Sentence::SharedPtr msg)
 {
   if (!client_) 
     return;
-  
-  if (get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) 
+
+  if (connect_state_.load() != ConnectState::Connected) 
     return;
 
+  std::lock_guard<std::mutex> lk(client_mtx_);
   client_->send_nmea(msg->sentence);
 }
 
@@ -220,7 +314,7 @@ void NTRIPRosBase::subscribe_fix(const sensor_msgs::msg::NavSatFix::SharedPtr ms
   if (!client_) 
     return;
 
-  if (get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) 
+  if (connect_state_.load() != ConnectState::Connected) 
     return;
 
   // Timestamp -> hhmmss.cc using LOCAL time (Python uses datetime.fromtimestamp,
@@ -299,12 +393,21 @@ void NTRIPRosBase::publish_rtcm()
   if (!rtcm_pub_ || !rtcm_pub_->is_activated()) 
     return;
 
-  for (auto& raw : client_->recv_rtcm()) 
+  if (connect_state_.load() != ConnectState::Connected) 
+    return;
+
+  std::vector<std::vector<uint8_t>> frames;
+  {
+    std::lock_guard<std::mutex> lk(client_mtx_);
+    frames = client_->recv_rtcm();
+  }
+
+  for (auto & raw : frames)
   {
     rtcm_msgs::msg::Message msg;
-    msg.header.stamp = now();
+    msg.header.stamp    = now();
     msg.header.frame_id = rtcm_frame_id_;
-    msg.message = raw;
+    msg.message         = std::move(raw);
     rtcm_pub_->publish(msg);
   }
 }
